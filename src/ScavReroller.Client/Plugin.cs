@@ -18,7 +18,7 @@ namespace ScavReroller.Client;
 /// Conservative MVP: an IMGUI button shown only on the character selection screen.
 /// Refreshes the session's scav slot and preview after server-side generation.
 /// </summary>
-[BepInPlugin("local.scav.loadout.reroller.client", "Scav Loadout Reroller", "0.1.8")]
+[BepInPlugin("local.scav.loadout.reroller.client", "Scav Loadout Reroller", "0.1.9")]
 [BepInDependency("com.SPT.core")]
 public sealed class Plugin : BaseUnityPlugin
 {
@@ -33,6 +33,9 @@ public sealed class Plugin : BaseUnityPlugin
     private string _status = "";
     private GUIStyle? _buttonStyle;
     private GUIStyle? _labelStyle;
+    private Texture2D? _eyeTexture;
+    private GUIContent? _eyeContent;
+    private ScavInventoryPreview? _inventoryPreview;
     private MatchMakerSideSelectionScreen? _sideSelectionScreen;
     private MenuOverlay? _overlay;
     private static MethodInfo? _getFikaSession;
@@ -41,7 +44,7 @@ public sealed class Plugin : BaseUnityPlugin
     {
         _instance = this;
         _showButton = Config.Bind("UI", "ShowButton", true,
-            "Show Scav Reroll only on the character selection screen.");
+            "Show Scav Reroll and inventory preview buttons on the character selection screen.");
         _buttonCenterX = Config.Bind("UI", "ButtonCenterX", 0.382f,
             "Relative X position (0..1). Default aligns with SCAV on the provided 16:9 selection screen.");
         _buttonY = Config.Bind("UI", "ButtonY", 0.66f,
@@ -77,7 +80,8 @@ public sealed class Plugin : BaseUnityPlugin
 
     internal void DrawMenu()
     {
-        if ((!_showButton.Value && !_refreshRequired) || !IsSideSelectionScreenOpen()) return;
+        if ((!_showButton.Value && !_refreshRequired) || !IsSideSelectionScreenOpen() ||
+            _inventoryPreview?.IsOpen == true) return;
 
         // UI rendered separately, without patching Fika / UI Fixes screens.
         if (_buttonStyle == null)
@@ -94,6 +98,8 @@ public sealed class Plugin : BaseUnityPlugin
                 alignment = TextAnchor.MiddleCenter,
                 wordWrap = true
             };
+            _eyeTexture = EyeIcon.Create();
+            _eyeContent = new GUIContent(_eyeTexture, "View SCAV inventory");
         }
 
         // Best-effort coordinates for the provided 1651x928 selection-screen screenshot.
@@ -110,6 +116,12 @@ public sealed class Plugin : BaseUnityPlugin
         {
             _ = Reroll();
         }
+        GUI.enabled = !_pending && !_refreshRequired;
+        var eyeWidth = height + 10f;
+        var eyeX = x + width + 8f;
+        if (eyeX + eyeWidth > Screen.width - 5f) eyeX = Mathf.Max(5f, x - eyeWidth - 8f);
+        if (GUI.Button(new Rect(eyeX, y, eyeWidth, height), _eyeContent, _buttonStyle))
+            OpenScavInventory();
         GUI.enabled = true;
         if (!string.IsNullOrEmpty(_status))
         {
@@ -119,9 +131,29 @@ public sealed class Plugin : BaseUnityPlugin
         }
     }
 
+    private void OpenScavInventory()
+    {
+        if (_pending || _refreshRequired || !IsSideSelectionScreenOpen() || GameWorldPresent()) return;
+        try
+        {
+            var scav = GetFikaSession()?.ProfileOfPet;
+            if (scav?.Inventory == null)
+                throw new InvalidOperationException("Player scav inventory is not ready.");
+            if (_inventoryPreview == null) _inventoryPreview = new ScavInventoryPreview();
+            _inventoryPreview.Open(scav);
+            Logger.LogInfo("Opened a detached preview of the current scav inventory.");
+        }
+        catch (Exception ex)
+        {
+            _status = "Inventory preview unavailable. See BepInEx log.";
+            Logger.LogError(ex);
+        }
+    }
+
     private async Task Reroll()
     {
         if (_pending) return;
+        _inventoryPreview?.Close();
         _pending = true;
         try
         {
@@ -197,6 +229,7 @@ public sealed class Plugin : BaseUnityPlugin
     private static void SelectionScreenClosed(MatchMakerSideSelectionScreen __instance)
     {
         if (_instance == null || !ReferenceEquals(_instance._sideSelectionScreen, __instance)) return;
+        _instance._inventoryPreview?.Close();
         if (_instance._overlay != null) _instance._overlay.enabled = false;
         _instance._sideSelectionScreen = null;
     }
@@ -214,6 +247,8 @@ public sealed class Plugin : BaseUnityPlugin
     {
         _harmony?.UnpatchSelf();
         _refresh?.Dispose();
+        _inventoryPreview?.Dispose();
+        if (_eyeTexture != null) Object.Destroy(_eyeTexture);
         if (_overlay != null)
         {
             _overlay.Owner = null;
