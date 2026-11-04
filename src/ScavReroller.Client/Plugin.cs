@@ -1,5 +1,7 @@
 using System;
+using System.IO;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 using BepInEx;
 using BepInEx.Configuration;
@@ -18,16 +20,18 @@ namespace ScavReroller.Client;
 /// Conservative MVP: an IMGUI button shown only on the character selection screen.
 /// Refreshes the session's scav slot and preview after server-side generation.
 /// </summary>
-[BepInPlugin("local.scav.loadout.reroller.client", "Scav Loadout Reroller", "0.1.9")]
+[BepInPlugin("local.scav.loadout.reroller.client", "Scav Loadout Reroller", "0.1.11")]
 [BepInDependency("com.SPT.core")]
 public sealed class Plugin : BaseUnityPlugin
 {
     private ConfigEntry<bool> _showButton = null!;
     private ConfigEntry<float> _buttonCenterX = null!;
     private ConfigEntry<float> _buttonY = null!;
-    private bool _pending;
-    private bool _refreshRequired;
-    private ScavProfileRefresh? _refresh;
+    private readonly RerollRecoveryState _recovery = new RerollRecoveryState();
+    private SelectionNavigationGuard? _navigation;
+    private CancellationTokenSource? _operationCancellation;
+    private ClientBackendSession? _recoverySession;
+    private int _screenVersion;
     private Harmony? _harmony;
     private static Plugin? _instance;
     private string _status = "";
@@ -75,12 +79,12 @@ public sealed class Plugin : BaseUnityPlugin
             if (_overlay != null) _overlay.enabled = false;
             return;
         }
-        _refresh?.KeepNavigationBlocked();
+        _navigation?.Apply(_recovery);
     }
 
     internal void DrawMenu()
     {
-        if ((!_showButton.Value && !_refreshRequired) || !IsSideSelectionScreenOpen() ||
+        if ((!_showButton.Value && !_recovery.NeedsRefresh) || !IsSideSelectionScreenOpen() ||
             _inventoryPreview?.IsOpen == true) return;
 
         // UI rendered separately, without patching Fika / UI Fixes screens.
@@ -110,13 +114,13 @@ public sealed class Plugin : BaseUnityPlugin
             5f, Mathf.Max(5f, Screen.width - width - 5f));
         var y = Mathf.Clamp(Screen.height * _buttonY.Value, 5f,
             Mathf.Max(5f, Screen.height - height - 5f));
-        GUI.enabled = !_pending;
-        var buttonText = _pending ? "Updating..." : _refreshRequired ? "Retry refresh" : "Reroll SCAV";
+        GUI.enabled = !_recovery.Busy;
+        var buttonText = _recovery.Busy ? "Updating..." : "Reroll SCAV";
         if (GUI.Button(new Rect(x, y, width, height), buttonText, _buttonStyle))
         {
-            _ = Reroll();
+            _ = RunOperation();
         }
-        GUI.enabled = !_pending && !_refreshRequired;
+        GUI.enabled = !_recovery.Busy && !_recovery.NeedsRefresh;
         var eyeWidth = height + 10f;
         var eyeX = x + width + 8f;
         if (eyeX + eyeWidth > Screen.width - 5f) eyeX = Mathf.Max(5f, x - eyeWidth - 8f);
@@ -133,7 +137,7 @@ public sealed class Plugin : BaseUnityPlugin
 
     private void OpenScavInventory()
     {
-        if (_pending || _refreshRequired || !IsSideSelectionScreenOpen() || GameWorldPresent()) return;
+        if (_recovery.Busy || _recovery.NeedsRefresh || !IsSideSelectionScreenOpen() || GameWorldPresent()) return;
         try
         {
             var scav = GetFikaSession()?.ProfileOfPet;
@@ -150,67 +154,93 @@ public sealed class Plugin : BaseUnityPlugin
         }
     }
 
-    private async Task Reroll()
+    private async Task RunOperation()
     {
-        if (_pending) return;
-        _inventoryPreview?.Close();
-        _pending = true;
-        try
+        if (!_recovery.TryBegin()) return;
+        var operationId = Guid.NewGuid().ToString("N").Substring(0, 12);
+        var stage = "selection";
+        using (var cancellation = new CancellationTokenSource())
         {
-            var session = GetFikaSession();
-            var screen = _sideSelectionScreen as MatchMakerSideSelectionScreen;
-            if (session == null || screen == null || !IsSideSelectionScreenOpen())
-                throw new InvalidOperationException("Character selection session is not ready.");
-            if (_refresh != null && !_refresh.Matches(session, screen))
+            _operationCancellation = cancellation;
+            var screenVersion = _screenVersion;
+            try
             {
-                _refresh.Dispose();
-                _refresh = null;
-            }
-            if (_refresh == null) _refresh = new ScavProfileRefresh(session, screen);
-
-            if (!_refreshRequired)
-            {
+                _inventoryPreview?.Close();
+                var session = GetFikaSession();
+                var screen = _sideSelectionScreen;
+                if (session == null || screen == null || !IsSideSelectionScreenOpen())
+                    throw new InvalidOperationException("Character selection session is not ready.");
+                if (!ReferenceEquals(_recoverySession, session))
+                {
+                    _recovery.ResetForSession();
+                    _recoverySession = session;
+                }
+                if (_navigation == null) _navigation = new SelectionNavigationGuard(screen);
+                _navigation.Apply(_recovery);
                 _status = "Contacting SPT server...";
-                // Until the reply is known, a timeout may mean the server has
-                // already applied the reroll. Recovery only reloads profiles.
-                _refreshRequired = true;
-                var body = await RequestHandler.PostJsonAsync("/scavreroller/reroll", "{}");
-                var result = JsonUtility.FromJson<RerollReply>(body);
-                if (result == null) throw new InvalidOperationException("Empty reroll response.");
+                stage = "reroll-request";
+                _recovery.GenerationRequested();
+                // Every click generates once, then loads that scav. The
+                // transport must not replay a timed-out generation request.
+                var result = await OperationDeadline.Wait(session.Send<RerollReply>(new SendRequest
+                {
+                    Url = RequestHandler.Host.TrimEnd('/') + "/scavreroller/reroll",
+                    ParseInBackground = true,
+                    TimeoutSeconds = 15,
+                    Retries = SendRequest.NoRetries,
+                    HandlingMode = ERequestHandlingMode.AbortOnFail
+                }), TimeSpan.FromSeconds(20), cancellation.Token);
+                if (result == null || (!result.ok && string.IsNullOrWhiteSpace(result.message)))
+                    throw new InvalidOperationException("Invalid reroll response.");
                 if (!result.ok)
                 {
-                    // A well-formed explicit rejection did not change the profile.
-                    // Unknown/malformed replies still require a profile refresh.
-                    if (string.IsNullOrWhiteSpace(result.message))
-                        throw new InvalidOperationException("Invalid reroll response.");
-                    _refreshRequired = false;
+                    _recovery.GenerationRejected();
                     _status = result.message;
-                    Logger.LogWarning("Scav reroll rejected: " + _status);
+                    Logger.LogWarning("Reroll rejected [" + operationId + "]: " + _status);
                     return;
                 }
-            }
 
-            _status = "Loading new scav profile and preview...";
-            await _refresh.RefreshAsync();
-            _refreshRequired = false;
-            _status = "Scav updated. Ready to raid.";
-            Logger.LogInfo("Scav session profile and preview refreshed; PMC profile preserved.");
-        }
-        catch (Exception ex)
-        {
-            _status = _refreshRequired
-                ? "Refresh failed. Click Retry refresh before continuing."
-                : "Reroll unavailable: " + ex.Message;
-            Logger.LogError(ex);
-        }
-        finally
-        {
-            _pending = false;
-            if (!_refreshRequired)
-            {
-                _refresh?.Dispose();
-                _refresh = null;
+                _status = "Loading scav profile and preview...";
+                var refresh = new ScavProfileRefresh(session, screen);
+                await refresh.RefreshAsync(cancellation.Token,
+                    () => _screenVersion == screenVersion && ReferenceEquals(_sideSelectionScreen, screen) &&
+                        IsSideSelectionScreenOpen(),
+                    value => stage = value, () => _recovery.ProfileApplied());
+                _status = "Scav updated. Ready to raid.";
+                Logger.LogInfo("Scav profile and preview refreshed [" + operationId + "].");
             }
+            catch (OperationCanceledException)
+            {
+                _status = "Update cancelled. Click Reroll SCAV to try again.";
+                Logger.LogInfo("Scav operation cancelled [" + operationId + "] at " + stage + ".");
+            }
+            catch (Exception ex)
+            {
+                _status = "Update failed (" + stage + "). Click Reroll SCAV to try again.";
+                RecordFailure(operationId, stage, ex);
+            }
+            finally
+            {
+                cancellation.Cancel();
+                if (ReferenceEquals(_operationCancellation, cancellation)) _operationCancellation = null;
+                _recovery.End();
+                _navigation?.Apply(_recovery);
+            }
+        }
+    }
+
+    private void RecordFailure(string operationId, string stage, Exception error)
+    {
+        var detail = "[" + DateTime.UtcNow.ToString("O") + "] operation=" + operationId +
+            " stage=" + stage + Environment.NewLine + error + Environment.NewLine;
+        Logger.LogError(detail);
+        try
+        {
+            File.AppendAllText(Path.Combine(BepInEx.Paths.BepInExRootPath, "ScavReroller-errors.log"), detail);
+        }
+        catch (Exception logError)
+        {
+            Logger.LogWarning("Unable to append persistent reroll error log: " + logError.Message);
         }
     }
 
@@ -223,12 +253,20 @@ public sealed class Plugin : BaseUnityPlugin
     {
         if (_instance == null || _instance._overlay == null) return;
         _instance._sideSelectionScreen = __instance;
+        _instance._screenVersion++;
+        _instance._navigation?.Dispose();
+        _instance._navigation = new SelectionNavigationGuard(__instance);
+        _instance._navigation.Apply(_instance._recovery);
         _instance._overlay.enabled = true;
     }
 
     private static void SelectionScreenClosed(MatchMakerSideSelectionScreen __instance)
     {
         if (_instance == null || !ReferenceEquals(_instance._sideSelectionScreen, __instance)) return;
+        _instance._screenVersion++;
+        _instance._operationCancellation?.Cancel();
+        _instance._navigation?.Dispose();
+        _instance._navigation = null;
         _instance._inventoryPreview?.Close();
         if (_instance._overlay != null) _instance._overlay.enabled = false;
         _instance._sideSelectionScreen = null;
@@ -236,9 +274,11 @@ public sealed class Plugin : BaseUnityPlugin
 
     internal static bool GameWorldPresent() => Singleton<GameWorld>.Instantiated;
 
-    private static bool BlockNavigationCommands(ref InputNode.ETranslateResult __result)
+    private static bool BlockNavigationCommands(ECommand __0, ref InputNode.ETranslateResult __result)
     {
-        if (_instance == null || (!_instance._pending && !_instance._refreshRequired)) return true;
+        // Escape always remains usable. Closing selection cancels local work
+        // and prevents a late HTTP response from being applied to another screen.
+        if (__0.IsCommand(ECommand.Escape) || _instance == null || !_instance._recovery.Busy) return true;
         __result = InputNode.ETranslateResult.BlockAll;
         return false;
     }
@@ -246,7 +286,8 @@ public sealed class Plugin : BaseUnityPlugin
     private void OnDestroy()
     {
         _harmony?.UnpatchSelf();
-        _refresh?.Dispose();
+        _operationCancellation?.Cancel();
+        _navigation?.Dispose();
         _inventoryPreview?.Dispose();
         if (_eyeTexture != null) Object.Destroy(_eyeTexture);
         if (_overlay != null)
@@ -278,9 +319,9 @@ public sealed class Plugin : BaseUnityPlugin
     }
 
     [Serializable]
-    private sealed class RerollReply
+    internal sealed class RerollReply
     {
-        // JsonUtility populates these public fields during deserialization.
+        // Populated by the game's backend deserializer.
         public bool ok = false;
         public string message = string.Empty;
     }

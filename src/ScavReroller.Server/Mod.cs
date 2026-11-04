@@ -17,7 +17,7 @@ public sealed record ScavRerollerMetadata : IModMetadata
     public string Name { get; init; } = "Scav Loadout Reroller";
     public string Author { get; init; } = "Community";
     public List<string>? Contributors { get; init; }
-    public SemanticVersioning.Version Version { get; init; } = new("0.1.3");
+    public SemanticVersioning.Version Version { get; init; } = new("0.1.5");
     public SemanticVersioning.Range SptVersion { get; init; } = new("~4.1.0");
     public List<string>? Incompatibilities { get; init; }
     public Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; }
@@ -39,7 +39,11 @@ public sealed class ScavRerollerRouter : StaticRouter
             new RouteAction<EmptyRequestData>(
                 "/scavreroller/reroll",
                 async (url, info, sessionId, output, cancellationToken) =>
-                    await handler.GenerateAsync(sessionId, cancellationToken))
+                    await handler.GenerateAsync(sessionId, cancellationToken)),
+            new RouteAction<EmptyRequestData>(
+                "/scavreroller/profile",
+                async (url, info, sessionId, output, cancellationToken) =>
+                    await handler.GetScavAsync(sessionId, cancellationToken))
         ])
     {
     }
@@ -47,9 +51,34 @@ public sealed class ScavRerollerRouter : StaticRouter
 
 /// <summary>Server-side reroll with a single serialization gate for generator caches.</summary>
 [Injectable]
-public sealed class ScavRerollerHandler(PlayerScavGenerator generator, SaveServer saveServer)
+public sealed class ScavRerollerHandler(PlayerScavGenerator generator, SaveServer saveServer, HttpResponseUtil response)
 {
     private static readonly SemaphoreSlim GenerateGate = new(1, 1);
+
+    public async ValueTask<string> GetScavAsync(MongoId sessionId, CancellationToken cancellationToken)
+    {
+        // Read one authoritative scav under the same gate as this mod's
+        // generator. Do not call ProfileController.GetCompleteProfile, generate
+        // another scav or expose other profiles through a refresh request.
+        await GenerateGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!saveServer.ProfileExists(sessionId))
+                return response.GetBody(new { ok = false, message = "Player profile does not exist." });
+            var characters = saveServer.GetProfile(sessionId).CharacterData;
+            var scav = characters?.ScavData;
+            var pmcScavId = characters?.PmcData?.Savage?.ToString();
+            if (scav?.Id is null || string.IsNullOrEmpty(pmcScavId) || scav.Id.Value.ToString() != pmcScavId)
+                return response.GetBody(new { ok = false, message = "Server scav identity is inconsistent. Generate a new scav." });
+            return response.GetBody(new { ok = true, message = "", profile = scav, pmcScavId });
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            Console.Error.WriteLine($"[ScavReroller] Snapshot error: {e}");
+            return response.GetBody(new { ok = false, message = "Unable to read the scav. See the SPT server log." });
+        }
+        finally { GenerateGate.Release(); }
+    }
 
     public async ValueTask<string> GenerateAsync(MongoId sessionId, CancellationToken cancellationToken)
     {
@@ -103,5 +132,9 @@ public sealed class ScavRerollerHandler(PlayerScavGenerator generator, SaveServe
     }
 
     private static string Reply(bool ok, string message) =>
-        JsonSerializer.Serialize(new { ok, message });
+        // Legacy clients read the top-level fields; the native game backend
+        // reads the standard err/errmsg/data envelope. Both see the same result.
+        // Native EFT rejects even an empty error string. Logical rejections
+        // live in data.ok/message; a successful transport must use null here.
+        JsonSerializer.Serialize(new { ok, message, err = 0, errmsg = (string?)null, data = new { ok, message } });
 }

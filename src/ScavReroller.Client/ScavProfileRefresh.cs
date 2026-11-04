@@ -1,121 +1,131 @@
 using System;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 using EFT;
 using EFT.UI;
 using EFT.UI.Matchmaker;
 using SPT.Common.Http;
-using UnityEngine;
 
 namespace ScavReroller.Client;
 
-/// <summary>Updates the scav slot without replacing the live PMC or its controllers.</summary>
-internal sealed class ScavProfileRefresh : IDisposable
+/// <summary>Reads one authoritative scav and leaves the PMC and its controllers intact.</summary>
+internal sealed class ScavProfileRefresh
 {
     private const BindingFlags Fields = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
     private static readonly FieldInfo ScavProfileField = RequiredField("_savageProfile");
     private static readonly FieldInfo ModelField = RequiredField("_savageModelView");
+    private static readonly FieldInfo PetIdField = typeof(Profile).GetField("PetId", Fields)
+        ?? throw new MissingFieldException(typeof(Profile).FullName, "PetId");
     private readonly ClientBackendSession _session;
     private readonly MatchMakerSideSelectionScreen _screen;
-    private readonly DefaultUIButton _next;
-    private readonly DefaultUIButton _back;
-    private readonly bool _nextWasEnabled;
-    private readonly bool _backWasEnabled;
 
     internal ScavProfileRefresh(ClientBackendSession session, MatchMakerSideSelectionScreen screen)
     {
         _session = session;
         _screen = screen;
-        _next = (DefaultUIButton)RequiredField("_nextButton").GetValue(screen);
-        _back = (DefaultUIButton)RequiredField("_backButton").GetValue(screen);
-        if (_next == null || _back == null || ModelField.GetValue(screen) == null)
-            throw new InvalidOperationException("Character selection UI is not ready.");
-        _nextWasEnabled = _next.Interactable;
-        _backWasEnabled = _back.Interactable;
         if (_session.ProfileOfPet == null || _session.AllProfiles == null)
             throw new InvalidOperationException("Player scav profile is not ready.");
-        KeepNavigationBlocked();
+        if (ModelField.GetValue(screen) == null)
+            throw new InvalidOperationException("Character preview is not ready.");
     }
 
-    internal void KeepNavigationBlocked()
-    {
-        if (_next != null) _next.Interactable = false;
-        if (_back != null) _back.Interactable = false;
-    }
-
-    internal bool Matches(ClientBackendSession session, MatchMakerSideSelectionScreen screen) =>
-        ReferenceEquals(_session, session) && ReferenceEquals(_screen, screen);
-
-    internal async Task RefreshAsync()
+    internal async Task RefreshAsync(CancellationToken cancellation, Func<bool> isCurrent,
+        Action<string> stage, Action profileApplied)
     {
         var originalPmc = _session.Profile;
         var originalScav = _session.ProfileOfPet;
-        var scavId = originalScav.Id;
-
-        // Same request and deserializer as EftClientBackendSession.GetProfiles,
-        // without its replacement of the PMC and InsuranceCompany.
-        var descriptors = await _session.Send<ProfileDescriptor[]>(new SendRequest
+        stage("profile-request");
+        var snapshot = await OperationDeadline.Wait(_session.Send<ScavSnapshot>(new SendRequest
         {
-            Url = RequestHandler.Host.TrimEnd('/') + "/client/game/profile/list",
+            Url = RequestHandler.Host.TrimEnd('/') + "/scavreroller/profile",
             ParseInBackground = true,
-            Retries = SendRequest.DefaultRetries,
+            TimeoutSeconds = 15,
+            Retries = SendRequest.NoRetries,
             HandlingMode = ERequestHandlingMode.AbortOnFail
-        });
+        }), TimeSpan.FromSeconds(20), cancellation);
+        cancellation.ThrowIfCancellationRequested();
+        if (snapshot == null || !snapshot.ok || snapshot.profile == null)
+            throw new InvalidOperationException(snapshot?.message ?? "Empty scav snapshot. Install server mod 0.1.5.");
+        if (snapshot.profile.Id.ToString() != snapshot.pmcScavId)
+            throw new InvalidOperationException("Server returned an inconsistent scav identity.");
 
-        ProfileDescriptor? scavDescriptor = null;
-        foreach (var descriptor in descriptors)
-        {
-            if (descriptor.Id.ToString() != scavId) continue;
-            if (scavDescriptor != null)
-                throw new InvalidOperationException("Server returned duplicate scav profiles.");
-            scavDescriptor = descriptor;
-        }
-        if (scavDescriptor == null)
-            throw new InvalidOperationException("Server response did not contain the current player scav.");
-
-        var newScav = new Profile(scavDescriptor);
+        stage("profile-decode");
+        var newScav = new Profile(snapshot.profile);
         if (newScav.Inventory == null)
             throw new InvalidOperationException("New scav profile has no inventory.");
         if (newScav.Inventory.DeserializationErrors.Count != 0)
         {
             ItemFactory.LogErrors(newScav.Inventory.DeserializationErrors, "rerolled player scav");
-            throw new InvalidOperationException("New scav inventory could not be loaded. See the game log.");
+            throw new InvalidOperationException("Scav inventory deserialization failed. See the game log.");
         }
 
-        if (!ReferenceEquals(Plugin.GetFikaSession(), _session) ||
+        cancellation.ThrowIfCancellationRequested();
+        if (!isCurrent() || !ReferenceEquals(Plugin.GetFikaSession(), _session) ||
             !ReferenceEquals(_session.Profile, originalPmc) ||
             !ReferenceEquals(_session.ProfileOfPet, originalScav) || Plugin.GameWorldPresent())
-            throw new InvalidOperationException("Game session changed while refreshing the scav.");
+            throw new OperationCanceledException("Selection or game session changed while refreshing the scav.", cancellation);
 
+        stage("profile-apply");
         var profiles = ProfileSlots.ReplaceSingleReference(_session.AllProfiles, originalScav, newScav);
         var previousProfiles = _session.AllProfiles;
-        _session.AllProfiles = profiles;
-        if (!ReferenceEquals(_session.ProfileOfPet, newScav))
+        var previousPetId = originalPmc.PetId;
+        // The server may have replaced the scav after a raid. Keep the same PMC
+        // instance/controllers, but adopt its authoritative scav link.
+        var linkChanged = previousPetId?.ToString() != snapshot.pmcScavId;
+        try
+        {
+            if (linkChanged)
+            {
+                // PetId is an instance readonly field in this EFT build. Change
+                // only the server-authoritative link, not the PMC object itself.
+                MongoID? authoritativeId = snapshot.pmcScavId;
+                PetIdField.SetValue(originalPmc, authoritativeId);
+            }
+            _session.AllProfiles = profiles;
+            if (!ReferenceEquals(_session.ProfileOfPet, newScav))
+                throw new InvalidOperationException("Session did not select the refreshed scav profile.");
+        }
+        catch
         {
             _session.AllProfiles = previousProfiles;
-            throw new InvalidOperationException("Session did not select the refreshed scav profile.");
+            if (linkChanged) PetIdField.SetValue(originalPmc, previousPetId);
+            throw;
         }
-
-        // If the screen was closed by the game, its next Show will read the
-        // updated session. Never reopen a closed screen from an async callback.
-        if (_screen == null || !_screen.gameObject.activeInHierarchy) return;
+        // Model errors must not mark an already synchronised inventory as stale.
+        profileApplied();
+        stage("screen-bind");
         ScavProfileField.SetValue(_screen, newScav);
+
+        stage("preview-load");
         var model = (PlayerModelView)ModelField.GetValue(_screen);
         model.Close();
-        // The stock scav Show uses no inventory controller, a no-op callback,
-        // a five-second delay, no custom position and the final flag enabled.
-        await model.Show(newScav, null, () => { }, 5f, null, true);
-        if (_screen != null && _screen.gameObject.activeInHierarchy && !model.LoadingComplete)
-            throw new InvalidOperationException("Scav preview did not finish loading.");
-    }
-
-    public void Dispose()
-    {
-        if (_next != null) _next.Interactable = _nextWasEnabled;
-        if (_back != null) _back.Interactable = _backWasEnabled;
+        try
+        {
+            await OperationDeadline.Wait(model.Show(newScav, null, () => { }, 5f, null, true),
+                TimeSpan.FromSeconds(25), cancellation);
+            cancellation.ThrowIfCancellationRequested();
+            if (isCurrent() && !model.LoadingComplete)
+                throw new InvalidOperationException("Scav preview did not finish loading.");
+        }
+        catch
+        {
+            // Close cancels the native model loader. Do not close a later
+            // screen's model if selection was closed/reopened in the meantime.
+            if (isCurrent()) model.Close();
+            throw;
+        }
     }
 
     private static FieldInfo RequiredField(string name) =>
         typeof(MatchMakerSideSelectionScreen).GetField(name, Fields)
         ?? throw new MissingFieldException(typeof(MatchMakerSideSelectionScreen).FullName, name);
+
+    internal sealed class ScavSnapshot
+    {
+        public bool ok = false;
+        public string message = "";
+        public ProfileDescriptor? profile = null;
+        public string pmcScavId = "";
+    }
 }
